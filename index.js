@@ -179,7 +179,7 @@ app.post('/preferences', authenticateJWT, async (req, res) => {
   }
 });
 
-// Analyze product endpoint with AWS S3 upload - UPDATED TO USE EXISTING BUCKET
+// Analyze product endpoint with AWS S3 upload - UPDATED TO SAVE RESPONSE TO DATABASE
 app.post('/api/analyze-product', authenticateJWT, upload.single('image'), async (req, res) => {
   try {
     const imageFile = req.file;
@@ -189,9 +189,14 @@ app.post('/api/analyze-product', authenticateJWT, upload.single('image'), async 
       return res.status(400).json({ error: 'No image provided' });
     }
 
-    // Validate user exists
+    // Validate user exists and fetch user with health information
     const user = await prismaClient.users.findUnique({
       where: { id: userId },
+      include: {
+        diseases: true,
+        allergies: true,
+        health_goals: true
+      }
     });
 
     if (!user) {
@@ -230,8 +235,8 @@ app.post('/api/analyze-product', authenticateJWT, upload.single('image'), async 
       const imageUrl = `${supabaseUrl}/storage/v1/object/public/${bucketName}/${fileName}`;
       console.log('Image URL:', imageUrl);
 
-      // Analyze the image using Google's Generative AI
-      const analysisResult = await performImageAnalysis(buffer);
+      // Analyze the image using Google's Generative AI with user's health information
+      const analysisResult = await performImageAnalysis(buffer, user);
       
       if (!analysisResult) {
         return res.status(500).json({ error: 'Image analysis failed' });
@@ -255,8 +260,20 @@ app.post('/api/analyze-product', authenticateJWT, upload.single('image'), async 
         }
       }
 
-      // Return all the results
+      // Save the analysis results to the database
+      const savedAnalysis = await prismaClient.product_analysis.create({
+        data: {
+          userId: userId,
+          imageUrl: imageUrl,
+          analysisJson: JSON.stringify(parsedAnalysis),
+          videoResultsJson: videoSearchResults ? JSON.stringify(videoSearchResults) : null,
+          shoppingResultsJson: shoppingSearchResults ? JSON.stringify(shoppingSearchResults) : null,
+        }
+      });
+
+      // Return all the results with the generated analysis ID
       return res.status(200).json({
+        id: savedAnalysis.id,
         imageUrl,
         analysis: parsedAnalysis,
         videoResults: videoSearchResults,
@@ -276,31 +293,126 @@ app.post('/api/analyze-product', authenticateJWT, upload.single('image'), async 
   }
 });
 
-// Function to analyze the image using Google's Generative AI
-async function performImageAnalysis(imageBuffer) {
+// New endpoint to retrieve analysis by ID
+app.get('/api/analysis/:id', async (req, res) => {
+  try {
+    const analysisId = parseInt(req.params.id);
+
+    if (isNaN(analysisId)) {
+      return res.status(400).json({ error: 'Invalid analysis ID' });
+    }
+
+    // Get the analysis record
+    const analysis = await prismaClient.product_analysis.findUnique({
+      where: { id: analysisId }
+    });
+
+    if (!analysis) {
+      return res.status(404).json({ error: 'Analysis not found' });
+    }
+
+    // Check if the analysis belongs to the authenticated user
+
+
+    // Parse the JSON strings back to objects
+    const parsedAnalysis = analysis.analysisJson ? JSON.parse(analysis.analysisJson) : null;
+    const videoResults = analysis.videoResultsJson ? JSON.parse(analysis.videoResultsJson) : null;
+    const shoppingResults = analysis.shoppingResultsJson ? JSON.parse(analysis.shoppingResultsJson) : null;
+
+    // Return the analysis data
+    return res.status(200).json({
+      id: analysis.id,
+      imageUrl: analysis.imageUrl,
+      analysis: parsedAnalysis,
+      videoResults: videoResults,
+      shoppingResults: shoppingResults,
+      createdAt: analysis.createdAt
+    });
+  } catch (error) {
+    console.error('Error retrieving analysis:', error);
+    return res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// Enhanced function to analyze the image using Google's Generative AI with user health profile
+async function performImageAnalysis(imageBuffer, user) {
   try {
     const model = genAI.getGenerativeModel({ model: 'models/gemini-1.5-pro' });
 
+    // Extract user health information
+    const userDiseases = user.diseases.map(d => d.name);
+    const userAllergies = user.allergies.map(a => a.name);
+    const userHealthGoals = user.health_goals.map(g => g.name);
+    const dietaryPreference = user.dietaryPreference;
+    
+    // Build health profile string
+    const healthProfileString = [];
+    if (userDiseases.length > 0) {
+      healthProfileString.push(`Health Conditions: ${userDiseases.join(", ")}`);
+    }
+    if (userAllergies.length > 0) {
+      healthProfileString.push(`Allergies: ${userAllergies.join(", ")}`);
+    }
+    if (userHealthGoals.length > 0) {
+      healthProfileString.push(`Health Goals: ${userHealthGoals.join(", ")}`);
+    }
+    if (dietaryPreference) {
+      healthProfileString.push(`Dietary Preference: ${dietaryPreference}`);
+    }
+
+    const healthProfileText = healthProfileString.length > 0 
+      ? `USER HEALTH PROFILE:\n${healthProfileString.join("\n")}` 
+      : "No specific health conditions or preferences provided";
+
     const prompt = `
-Analyze the provided image and perform the following tasks:
+Analyze this food-related image and provide a comprehensive nutritional assessment specifically tailored to the user's health profile below:
 
-1. **Introduction:**  
-   Generate a brief introductory description summarizing what the image is about. Include any context or details you can infer (such as the type of food or nutritional insights).
+${healthProfileText}
 
-2. **Product Name:**  
-   Based on the ingredients identified in the image, deduce and clearly state the product name. Use the ingredients as clues in your determination.
+1. **Context Detection:**
+   First, identify what type of image this is:
+   - Individual ingredient(s)
+   - Packaged food product with visible labeling
+   - Refrigerator/pantry contents
+   - Prepared meal/dish
+   - Other food-related context
 
-3. **Ingredients Extraction:**  
-   - List all the ingredients present in the image.
-   - For each ingredient, provide:
-      a. A healthy alternative (if available).
-      b. A shopping page keyword query to help find the healthy alternative.
-      c. A YouTube recipe keyword query related to the healthy alternative.
+2. **Introduction:**  
+   Write a concise yet detailed summary (2-3 sentences) describing what's in the image, its nutritional profile, and any notable health implications SPECIFICALLY RELATED to the user's health conditions, allergies, or goals.
 
-Present the final output in JSON format with the following keys:
-- "introduction": a description of what the image is about.
-- "productName": the product name derived from the ingredients.
-- "ingredients": an array of objects, each with "ingredient", "alternative", "shoppingQuery", and "recipeQuery".
+3. **Product/Food Name:**  
+   Identify the main food item(s) or product name. If multiple items exist, focus on the most prominent or nutritionally significant items.
+
+4. **Ingredient Analysis:**
+   - For packaged foods: Extract visible ingredients from packaging
+   - For fresh foods/ingredients: Identify the main components
+   - For refrigerator/pantry: List the most prominent food items visible
+   - For prepared meals: Identify the likely major ingredients
+   - FLAG any ingredients that may negatively impact the user's health conditions
+
+5. **Health-Tailored Recommendations:**
+   For each identified ingredient/food item:
+   - Provide a healthier alternative specifically suitable for the user's health profile
+   - Note compatibility or concerns with the user's health conditions/allergies
+   - Suggest a shopping query for finding alternatives that align with the user's health goals
+   - Recommend a recipe query that uses healthier ingredients suitable for the user's specific health needs
+
+Return ONLY a valid JSON object with this exact structure:
+{
+  "introduction": "Description of the food items with nutritional context specifically addressing user's health profile",
+  "productName": "Name of the main food product or collection of items",
+  "ingredients": [
+    {
+      "ingredient": "Identified ingredient/food item",
+      "alternative": "Healthier alternative suggestion tailored to user's health profile",
+      "shoppingQuery": "Query to find healthy alternatives online that suit user's health needs",
+      "recipeQuery": "Query for finding recipes with this healthy alternative suitable for user's health profile"
+    },
+    // Additional ingredients...
+  ]
+}
+
+Ensure your analysis is accurate, helpful, and SPECIFICALLY TAILORED to the user's health conditions, allergies, and goals. Make sure the JSON is properly formatted with no additional text outside the JSON structure.
 `;
 
     const result = await model.generateContent([

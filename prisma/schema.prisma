@@ -29,8 +29,8 @@ model health_goals {
 }
 
 model users {
-  id                Int            @id @default(autoincrement())
-  phone_number      String         @unique
+  id                Int                @id @default(autoincrement())
+  phone_number      String             @unique
   name              String
   password          String
   age               Int
@@ -38,9 +38,21 @@ model users {
   height            Float
   purpose           String
   dietaryPreference String
-  createdAt         DateTime       @default(now())
+  createdAt         DateTime           @default(now())
   updatedAt         DateTime
   allergies         allergies[]
   diseases          diseases[]
   health_goals      health_goals[]
+  product_analyses  product_analysis[]
+}
+
+model product_analysis {
+  id                 Int      @id @default(autoincrement())
+  userId             Int
+  imageUrl           String
+  analysisJson       String   @db.Text
+  videoResultsJson   String?  @db.Text
+  shoppingResultsJson String?  @db.Text
+  createdAt          DateTime @default(now())
+  users              users    @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
